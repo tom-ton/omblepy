@@ -20,6 +20,19 @@ class sharedDeviceDriverCode():
     #abstract method, implemented by the device specific driver
     def deviceSpecific_syncWithSystemTime(self):
         raise NotImplementedError("Please Implement this method in the device specific file.")
+
+    #optional hook, default just calls the legacy unlockWithUnlockKey (0x01 + 16-byte stored key).
+    #devices that use a different unlock protocol (e.g. HEM-7380T1-EBK uses 0x11 + 4-byte
+    #random nonce on every connection) override this.
+    async def deviceSpecific_unlock(self, btobj):
+        await btobj.unlockWithUnlockKey()
+
+    #optional hook, called once after successful initial pairing (after OS-level bond is
+    #established) to finalize the pairing on the application layer. Default is a no-op.
+    #Devices that need extra steps to commit the bond and/or app-level key to flash
+    #(e.g. HEM-7380T1-EBK requires specific EEPROM writes) override this.
+    async def deviceSpecific_pairFinalization(self, btobj):
+        return
     
     def _bytearrayBitsToInt(self, bytesArray, firstValidBitIdx, lastvalidBitIdx):
         bigInt = int.from_bytes(bytesArray, self.deviceEndianess)
@@ -36,7 +49,7 @@ class sharedDeviceDriverCode():
         self.cachedSettingsBytes[slice(*self.settingsUnreadRecordsBytes)] = newUnreadRecordSettings
     
     async def getRecords(self, btobj, useUnreadCounter, syncTime):
-        await btobj.unlockWithUnlockKey()
+        await self.deviceSpecific_unlock(btobj)
         await btobj.startTransmission()
 
         #cache settings for time sync and for unread record counter
@@ -48,7 +61,10 @@ class sharedDeviceDriverCode():
                 sectionNumBytes = section[1] - section[0]
                 if(sectionNumBytes >= 54):
                     raise ValueError("Section to big for a single read")
-                self.cachedSettingsBytes[slice(*section)] = await btobj.readContinuousEepromData(self.settingsReadAddress+section[0], sectionNumBytes, sectionNumBytes)
+                #chunk by transmissionBlockSize: most devices have section <= block
+                #(single-shot read, same as before), but some (e.g. HEM-7380T1-EBK)
+                #need a section larger than the device's max single-read size.
+                self.cachedSettingsBytes[slice(*section)] = await btobj.readContinuousEepromData(self.settingsReadAddress+section[0], sectionNumBytes, self.transmissionBlockSize)
         
         if(useUnreadCounter):
             allUsersReadCommandsList = await self._getReadCommands_OnlyNewRecords()
