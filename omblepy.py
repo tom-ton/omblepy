@@ -4,6 +4,7 @@ import bleak                                                        #bluetooth l
 import re                                                           #regex to match bt mac address
 import argparse                                                     #to process command line arguments
 import datetime
+import os                                                           #for urandom (cryptographically random unlock nonce)
 import sys
 import pathlib
 import logging
@@ -162,7 +163,13 @@ class bluetoothTxRxHandler:
         if(self.rxPacketType != bytearray.fromhex("8f00")):
             raise ValueError("invlid response to data readout end")
         if(self.rxDataBytes[0]):
-            raise ValueError(f"Device reported error status code {self.rxDataBytes[0]} while sending endTransmission command.")
+            #The device acknowledged the end-of-transmission (response type 0x8f
+            #was received) but reported a non-zero status byte. On HEM-7380T1-EBK
+            #this happens when settings are written without a matching timestamp
+            #write (e.g. status code 0xe5 after --newRecOnly) - the data made it
+            #through, the device just signals a soft warning. Log it and continue
+            #instead of throwing away the records we've already read.
+            logger.warning(f"Device reported non-zero endTransmission status: 0x{self.rxDataBytes[0]:02x}")
         await self._disableRxChannelNotifyAndCallback()
 
     async def _writeBlockEeprom(self, address, dataByteArray):
@@ -281,6 +288,43 @@ class bluetoothTxRxHandler:
         if(deviceResponse[:2] !=  bytearray.fromhex("8100")):
             raise ValueError(f"entered pairing key does not match stored one.")
             return
+        await bleClient.stop_notify(self.deviceUnlock_UUID)
+        return
+
+    async def unlockWithRandomKey(self):
+        """Unlock variant for devices like HEM-7380T1-EBK that expect:
+            request:  0x11 + 4 random bytes + 12 zero bytes
+            response: 0x91 0x00 + 4-byte echo of the random nonce
+        The 4 random bytes are a per-session nonce; the device accepts any
+        value on an already-encrypted link, so this must be called *after*
+        the OS-level BLE bond/encryption is up.
+        """
+        if not self.requiresUnlock:
+            return
+        nonce = os.urandom(4)
+        cmd = b'\x11' + nonce + b'\x00' * 12
+        # Per protocol "Enable Notifications on ALL characteristics": the
+        # device only processes 0x11 once both UNLOCK and RX channel CCCDs
+        # have been enabled. Set them up first, then write.
+        await self._enableRxChannelNotifyAndCallback()
+        await bleClient.start_notify(self.deviceUnlock_UUID, self._callbackForUnlockChannel)
+        await asyncio.sleep(0.2)  # let CCCD writes settle on the device side
+        self.rxFinishedFlag = False
+        # write without response: the device replies via the unlock-channel notification
+        await bleClient.write_gatt_char(self.deviceUnlock_UUID, cmd, response=False)
+        timeout = 3.0
+        while(self.rxFinishedFlag == False):
+            await asyncio.sleep(0.1)
+            timeout -= 0.1
+            if timeout < 0:
+                await bleClient.stop_notify(self.deviceUnlock_UUID)
+                raise ValueError("no response to 0x11 unlock; device may not be encrypted/bonded")
+        deviceResponse = self.rxDataBytes
+        if(deviceResponse[:2] != bytearray.fromhex("9100")):
+            await bleClient.stop_notify(self.deviceUnlock_UUID)
+            raise ValueError(f"unexpected unlock response: {convertByteArrayToHexString(deviceResponse)}")
+        if(deviceResponse[2:6] != nonce):
+            logger.warning(f"unlock nonce echo mismatch (sent {nonce.hex()}, got {deviceResponse[2:6].hex()})")
         await bleClient.stop_notify(self.deviceUnlock_UUID)
         return
 
@@ -404,18 +448,47 @@ async def main():
         print(" -do not accept any pairing dialog until you selected your device in the following list\n")
         bleAddr = await selectBLEdevices()
 
-    bleClient = bleak.BleakClient(bleAddr)
+    #event signalling that the peer terminated the connection (e.g. Reason 0x13 from
+    #the device after endTransmission). For some Omron variants the bond/key are only
+    #committed to flash when the central waits for the device-initiated disconnect.
+    deviceDisconnectedEvent = asyncio.Event()
+    def _onPeripheralDisconnect(_client):
+        deviceDisconnectedEvent.set()
+
+    bleClient = bleak.BleakClient(bleAddr, disconnected_callback = _onPeripheralDisconnect)
     try:
         logger.info(f"Attempt connecting to {bleAddr}.")
         await bleClient.connect()
-        if(args.pair and getattr(devSpecificDriver, "supportsOsBondingOnly", False)):
+
+        #explicit MTU exchange. Some flows (e.g. the HEM-7380T1-EBK pair-finalization
+        #EEPROM writes) need >23-byte payloads, so negotiate now while we know the
+        #connection is fresh. Best-effort: not all bleak backends expose this.
+        try:
+            backend = getattr(bleClient, "_backend", None)
+            mtuAcquire = getattr(backend, "_acquire_mtu", None) if backend is not None else None
+            if mtuAcquire is not None:
+                await mtuAcquire()
+                logger.debug(f"negotiated mtu = {bleClient.mtu_size}")
+        except Exception as e:
+            logger.debug(f"mtu acquire skipped: {e!r}")
+
+        needsOsBonding   = getattr(devSpecificDriver, "supportsOsBondingOnly", False)
+        # whether the driver has a non-default deviceSpecific_pairFinalization()
+        from sharedDriver import sharedDeviceDriverCode as _baseDriver
+        needsPairFinal   = (type(devSpecificDriver).deviceSpecific_pairFinalization
+                            is not _baseDriver.deviceSpecific_pairFinalization)
+
+        if(args.pair and needsOsBonding):
             logger.info("Requesting OS-level BLE bonding for this device.")
             try:
                 await bleClient.pair()
             except TypeError:
                 await bleClient.pair(protection_level=2)
             logger.info("OS-level BLE bonding request completed.")
-            return
+            if not needsPairFinal:
+                #legacy "OS-bond only" behavior (e.g. existing HEM-7380T1 driver)
+                return
+
         servicesResolved = False
         parentServiceUUID = getattr(devSpecificDriver, "parentService_UUID", LEGACY_PARENT_SERVICE_UUID)
         for _ in range(20):
@@ -430,16 +503,33 @@ async def main():
                              or that your OS has a bug when reading BT LE device attributes (certain linux versions).""")
         bluetoothTxRxObj = bluetoothTxRxHandler(devSpecificDriver)
         if(args.pair):
-            await bluetoothTxRxObj.writeNewUnlockKey()
-            #this seems to be necessary when the device has not been paired to any device
-            await bluetoothTxRxObj.startTransmission()
-            await bluetoothTxRxObj.endTransmission()
+            if needsOsBonding and needsPairFinal:
+                #app-level finalization on top of OS-level bond (e.g. HEM-7380T1-EBK).
+                #The driver is responsible for unlocking, EEPROM writes, and any
+                #other steps needed to commit the bond/key to flash.
+                logger.info("running device-specific pair finalization")
+                await devSpecificDriver.deviceSpecific_pairFinalization(bluetoothTxRxObj)
+            else:
+                #legacy app-level pairing (writes the omblepy unlock key)
+                await bluetoothTxRxObj.writeNewUnlockKey()
+                #this seems to be necessary when the device has not been paired to any device
+                await bluetoothTxRxObj.startTransmission()
+                await bluetoothTxRxObj.endTransmission()
         else:
             logger.info("communication started")
             allRecs = await devSpecificDriver.getRecords(btobj = bluetoothTxRxObj, useUnreadCounter = args.newRecOnly, syncTime = args.timeSync)
             logger.info("communication finished")
             appendCsv(allRecs)
             saveUBPMJson(allRecs)
+
+        #after a normal sync some devices terminate the link themselves, and
+        #waiting for that signal helps them flush state to flash. Best-effort with
+        #a short timeout; if it doesn't happen we just disconnect locally below.
+        try:
+            await asyncio.wait_for(deviceDisconnectedEvent.wait(), timeout=10.0)
+            logger.debug("device-initiated disconnect received")
+        except asyncio.TimeoutError:
+            logger.debug("no device-initiated disconnect within 10s, will close locally")
     finally:
         logger.info("disconnect")
         if bleClient.is_connected:
