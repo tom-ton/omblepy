@@ -421,7 +421,11 @@ async def main():
         raise ValueError("When not in pairing mode, please specify your device type name with -d or --device")
     if(args.device):
         deviceName = args.device.strip("'").strip('\"') #strip quotes around arg
-        sys.path.insert(0, "./deviceSpecific")
+        #resolve deviceSpecific/ relative to this script, not cwd, so omblepy
+        #can be invoked from any working directory (e.g. by an auto-sync daemon
+        #that needs cwd to be the CSV output directory).
+        deviceSpecificDir = str(pathlib.Path(__file__).resolve().parent / "deviceSpecific")
+        sys.path.insert(0, deviceSpecificDir)
         try:
             logger.info(f"Attempt to import module for device {deviceName.lower()}")
             deviceSpecific = __import__(deviceName.lower())
