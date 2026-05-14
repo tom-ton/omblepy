@@ -52,15 +52,16 @@ class deviceSpecificDriver(sharedDeviceDriverCode):
     recordByteSize             = 0x10
     transmissionBlockSize      = 0x10
 
-    #settings layout (matches HEM-7361T pattern, with the unread-records
-    #section expanded to 24 bytes - the EBK silently rejects the unread-counter
-    #reset (endTransmission returns 0xe5) when only 16 bytes are written here;
-    #the OMRON Connect Android app writes 24 bytes at 0x54 instead. Bytes
-    #0x10..0x17 of the cached settings buffer are an "ack/state" trailer that
-    #must be present in the write payload for the device to commit the reset.
+    #settings layout. Unread-records section is 0x22 = 34 bytes, the same
+    #size pair-finalization writes back at 0x54 (and which the device acks
+    #with endTransmission status 0x00). With shorter (16- or 24-byte) writes
+    #at 0x54 in a session that also contains the 0x80 timestamp/commit
+    #write, the device returns 0xe5 instead - and the BLE advertising
+    #"new data" status flag fails to flip back to 0x01. Reading 34 bytes
+    #also matches the OMRON Connect Android app's session-1 read coverage.
     settingsReadAddress        = 0x0010
     settingsWriteAddress       = 0x0054
-    settingsUnreadRecordsBytes = [0x00, 0x18]
+    settingsUnreadRecordsBytes = [0x00, 0x22]
     settingsTimeSyncBytes      = [0x2C, 0x3C]
 
     def deviceSpecific_ParseRecordFormat(self, singleRecordAsByteArray):
@@ -89,6 +90,14 @@ class deviceSpecificDriver(sharedDeviceDriverCode):
             year, month, day, hour, minute, second,
         )
         return recordDict
+
+    # No resetUnreadRecordsCounter() override: the parent's implementation
+    # (which only sets bytes 4-7 of the cached unread-records section to the
+    # 0x8000 sentinel and echoes the rest unchanged from the device's read
+    # response) is enough for the EBK, *provided* the section is 34 bytes
+    # wide - matching pair-finalization, which is acked with endTx 0x00.
+    # The byte-patching tried earlier (bytes 1/11/15/16/22/23) was a
+    # red-herring inherited from the 24-byte working theory.
 
     def deviceSpecific_syncWithSystemTime(self):
         # Update the cached 16-byte timestamp block at settingsTimeSyncBytes

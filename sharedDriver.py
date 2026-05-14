@@ -93,14 +93,20 @@ class sharedDeviceDriverCode():
         if(useUnreadCounter):
             self.resetUnreadRecordsCounter()
             
-        #maybe this could be combined into a single write
+        #write order: unread-counter reset FIRST, then time-sync.
+        #the time-sync block carries a "commit-to-flash" preamble byte
+        #(see device-specific syncWithSystemTime overrides) and the
+        #device interprets it as the closing write before endTransmission;
+        #issuing it last matches the OMRON Connect Android app's order
+        #(observed via HCI snoop) which acks endTx with status 0x00.
+        #Reverse order leaves HEM-7380T1-EBK reporting endTx 0xe5.
+        if(useUnreadCounter):
+            bytesToWrite = self.cachedSettingsBytes[slice(*self.settingsUnreadRecordsBytes)]
+            await btobj.writeContinuousEepromData(self.settingsWriteAddress + self.settingsUnreadRecordsBytes[0], bytesToWrite, btBlockSize = len(bytesToWrite))
         if(syncTime):
             self.deviceSpecific_syncWithSystemTime()
             bytesToWrite = self.cachedSettingsBytes[slice(*self.settingsTimeSyncBytes)]
             await btobj.writeContinuousEepromData(self.settingsWriteAddress + self.settingsTimeSyncBytes[0], bytesToWrite, btBlockSize = len(bytesToWrite))
-        if(useUnreadCounter):
-            bytesToWrite = self.cachedSettingsBytes[slice(*self.settingsUnreadRecordsBytes)]
-            await btobj.writeContinuousEepromData(self.settingsWriteAddress + self.settingsUnreadRecordsBytes[0], bytesToWrite, btBlockSize = len(bytesToWrite))
         
         await btobj.endTransmission()
         return allUserRecordsList
