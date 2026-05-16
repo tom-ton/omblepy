@@ -337,20 +337,48 @@ def readCsv(filename):
             records.append(oldRecordDict)
     return records
 
-def appendCsv(allRecords):
+def appendCsv(allRecords, noBackup=False):
     for userIdx in range(len(allRecords)):
         oldCsvFile = pathlib.Path(f"user{userIdx+1}.csv")
-        dateText = datetime.datetime.now().strftime('%Y_%m_%d__%H_%M_%S')
-        backup = pathlib.Path(f"backup_user{userIdx+1}_{dateText}.csv")
-        datesOfNewRecords = [record["datetime"] for record in allRecords[userIdx]]
-        if(oldCsvFile.is_file()):
+        datesOfNewRecords = set(record["datetime"] for record in allRecords[userIdx])
+
+        existingRecords = []
+        existingDates = set()
+        if oldCsvFile.is_file():
+            existingRecords = readCsv(f"user{userIdx+1}.csv")
+            existingDates = set(r["datetime"] for r in existingRecords)
+
+        #merge old + new (deduplicated by datetime; new wins on conflict).
+        #saveUBPMJson() consumes allRecords[userIdx] after this function so
+        #the merge has to happen even when the CSV ends up unchanged on disk.
+        allRecords[userIdx].extend(
+            filter(lambda x: x["datetime"] not in datesOfNewRecords, existingRecords)
+        )
+        allRecords[userIdx] = sorted(allRecords[userIdx], key=lambda x: x["datetime"])
+
+        actuallyNewDates = datesOfNewRecords - existingDates
+        if not actuallyNewDates and oldCsvFile.is_file():
+            #nothing to add; existing CSV is already authoritative. Skip both
+            #the backup and the rewrite. (Still need to stringify datetimes so
+            #saveUBPMJson() sees the same shape it always has.)
+            logger.info(f"user{userIdx+1}.csv: no new records ({len(datesOfNewRecords)} from device, all already on disk); skipping rewrite")
+            for rec in allRecords[userIdx]:
+                if isinstance(rec["datetime"], datetime.datetime):
+                    rec["datetime"] = rec["datetime"].strftime("%Y-%m-%d %H:%M:%S")
+            continue
+
+        if oldCsvFile.is_file() and not noBackup:
+            dateText = datetime.datetime.now().strftime('%Y_%m_%d__%H_%M_%S')
+            backup = pathlib.Path(f"backup_user{userIdx+1}_{dateText}.csv")
             backup.write_bytes(oldCsvFile.read_bytes())
-            records = readCsv(f"user{userIdx+1}.csv")
-            allRecords[userIdx].extend(filter(lambda x: x["datetime"] not in datesOfNewRecords,records))
-        allRecords[userIdx] = sorted(allRecords[userIdx], key = lambda x: x["datetime"])
-        logger.info(f"writing data to user{userIdx+1}.csv")
+            logger.debug(f"backed up user{userIdx+1}.csv -> {backup.name}")
+
+        if actuallyNewDates:
+            logger.info(f"writing data to user{userIdx+1}.csv (+{len(actuallyNewDates)} new, {len(allRecords[userIdx])} total)")
+        else:
+            logger.info(f"writing data to user{userIdx+1}.csv")
         with open(f"user{userIdx+1}.csv", mode='w', newline='', encoding='utf-8') as outfile:
-            writer = csv.DictWriter(outfile, fieldnames = ["datetime", "dia", "sys", "bpm", "mov", "ihb"])
+            writer = csv.DictWriter(outfile, fieldnames=["datetime", "dia", "sys", "bpm", "mov", "ihb"])
             writer.writeheader()
             for recordDict in allRecords[userIdx]:
                 recordDict["datetime"] = recordDict["datetime"].strftime("%Y-%m-%d %H:%M:%S")
@@ -397,6 +425,7 @@ async def main():
     parser.add_argument('-n', "--newRecOnly", action="store_true",          help="Considers the unread records counter and only reads new records. Resets these counters afterwards. If not enabled, all records are read and the unread counters are not cleared.")
     parser.add_argument('-t', "--timeSync",   action="store_true",          help="Update the time on the omron device by using the current system time.")
     parser.add_argument('-k', "--key",                          type=str,   help="Pairing key as a 32-character hex-string (e.g. 0123456789abcdef0123456789abcdef). If not specified, uses default key.")
+    parser.add_argument(      "--noBackup",   action="store_true",          help="Do not write a timestamped backup of the per-user CSV before overwriting it. By default a backup is written only when there are actually new records to merge in (a sync that produces zero new records skips both backup and CSV rewrite).")
     args = parser.parse_args()
 
     #setup logging
@@ -523,7 +552,7 @@ async def main():
             logger.info("communication started")
             allRecs = await devSpecificDriver.getRecords(btobj = bluetoothTxRxObj, useUnreadCounter = args.newRecOnly, syncTime = args.timeSync)
             logger.info("communication finished")
-            appendCsv(allRecs)
+            appendCsv(allRecs, noBackup = args.noBackup)
             saveUBPMJson(allRecs)
 
         #after a normal sync some devices terminate the link themselves, and
